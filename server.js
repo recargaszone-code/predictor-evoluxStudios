@@ -1,7 +1,7 @@
 // server.js
 import express from 'express';
 import cors from 'cors';
-import io from 'socket.io-client';
+import WebSocket from 'ws';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -9,11 +9,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Armazenamento em memória
+// ====================== ARMAZENAMENTO ======================
 const history = {
   placard: [],
   bet888:  [],
@@ -26,91 +25,103 @@ const lastUpdate = {
   betway:  null
 };
 
-// ==================== CONEXÃO COM O PREDICTOR ====================
-const wsUrl = "wss://predictor-uqfp.onrender.com/socket.io/?EIO=3&transport=websocket";
+// ====================== WEBSOCKET PURO ======================
+const WS_URL = "wss://predictor-uqfp.onrender.com/socket.io/?EIO=3&transport=websocket";
 
-console.log(`[START] Conectando ao predictor: ${wsUrl}`);
+let ws = null;
 
-const socket = io(wsUrl, {
-  transports: ['websocket'],
-  reconnection: true,
-  reconnectionAttempts: 999,
-  reconnectionDelay: 2000,
-  reconnectionDelayMax: 5000
-});
+function connectWebSocket() {
+  console.log(`[WS] Tentando conectar → ${WS_URL}`);
 
-socket.on('connect', () => {
-  console.log('[WS] ✅ Conectado ao predictor com sucesso!');
-});
+  ws = new WebSocket(WS_URL);
 
-socket.on('connect_error', (err) => {
-  console.error('[WS] ❌ Erro de conexão:', err.message);
-});
+  ws.on('open', () => {
+    console.log('[WS] ✅ Conexão aberta!');
+    ws.send('2probe');                    // Engine.IO probe
+    setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send('5'); // upgrade
+    }, 100);
+  });
 
-socket.on('disconnect', (reason) => {
-  console.log('[WS] Desconectado:', reason);
-});
+  ws.on('message', (data) => {
+    const msg = data.toString();
 
-// Recebe os eventos das casas
-socket.onAny((event, ...args) => {
-  if (['placard', 'bet888', 'betway'].includes(event) && Array.isArray(args[0])) {
-    const house = event;
-    const numbers = args[0];
+    // Handshake básico
+    if (msg.startsWith('0{')) { console.log('[WS] Handshake recebido'); return; }
+    if (msg === '40') { console.log('[WS] Namespace aberto'); return; }
+    if (msg === '3probe') { ws.send('5'); return; }
 
-    const currentLast = numbers[numbers.length - 1];
+    // Mensagens do tipo 42["casa", [números...]]
+    if (msg.startsWith('42')) {
+      try {
+        const parsed = JSON.parse(msg.slice(2));
+        if (Array.isArray(parsed) && parsed.length === 2) {
+          const [house, numbers] = parsed;
+          if (['placard', 'bet888', 'betway'].includes(house)) {
+            const currentLast = numbers[numbers.length - 1];
 
-    if (lastUpdate[house] !== currentLast) {
-      history[house] = numbers.slice(0, 120);
-      lastUpdate[house] = currentLast;
+            if (lastUpdate[house] !== currentLast) {
+              history[house] = numbers.slice(0, 120);
+              lastUpdate[house] = currentLast;
 
-      console.log(`[${house.toUpperCase()}] ✅ Atualizado | Último: ${currentLast.toFixed(2)}x | Total: ${numbers.length}`);
+              console.log(`[${house.toUpperCase()}] ✅ Atualizado | Último: ${currentLast.toFixed(2)}x`);
+            }
+          }
+        }
+      } catch (e) {
+        // ignora mensagens que não são JSON
+      }
     }
-  }
-});
+  });
 
-// ======================== ROTAS DA API ========================
+  ws.on('close', () => {
+    console.log('[WS] Conexão fechada. Reconectando em 3s...');
+    setTimeout(connectWebSocket, 3000);
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Erro:', err.message);
+  });
+}
+
+// ====================== API ======================
 app.get('/api/history/:house', (req, res) => {
   const house = req.params.house.toLowerCase();
-  
   if (!['placard', 'bet888', 'betway'].includes(house)) {
-    return res.status(400).json({ error: 'Casa inválida. Use: placard, bet888 ou betway' });
+    return res.status(400).json({ error: 'Use: placard, bet888 ou betway' });
   }
 
   const data = history[house] || [];
-  const unique = data.slice(0, 60); // remove duplicata
+  const unique = data.slice(0, 60);
 
   res.json({
     house,
     total: unique.length,
-    last: unique.length > 0 ? unique[unique.length - 1] : null,
+    last: unique.length ? unique[unique.length - 1] : null,
     history: unique
   });
 });
 
 app.get('/api/history', (req, res) => {
   const result = {};
-  for (const house of ['placard', 'bet888', 'betway']) {
-    const data = history[house] || [];
+  for (const h of ['placard', 'bet888', 'betway']) {
+    const data = history[h] || [];
     const unique = data.slice(0, 60);
-    result[house] = {
-      total: unique.length,
-      last: unique.length > 0 ? unique[unique.length - 1] : null,
-      history: unique
-    };
+    result[h] = { total: unique.length, last: unique.length ? unique[unique.length-1] : null, history: unique };
   }
   res.json(result);
 });
 
 app.get('/api/status', (req, res) => {
   res.json({
-    connected: socket.connected,
+    ws_connected: ws && ws.readyState === WebSocket.OPEN,
     last_updates: lastUpdate,
     timestamp: new Date().toISOString()
   });
 });
 
-// ======================== INICIA SERVIDOR ========================
+// ====================== START ======================
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`📡 Teste: http://localhost:${PORT}/api/history/bet888`);
+  connectWebSocket();   // inicia conexão com o predictor
 });
